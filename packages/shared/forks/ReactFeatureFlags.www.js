@@ -18,16 +18,19 @@ export const {
   disableInputAttributeSyncing,
   disableIEWorkarounds,
   enableTrustedTypesIntegration,
-  revertRemovalOfSiblingPrerendering,
   replayFailedUnitOfWorkWithInvokeGuardedCallback,
   enableLegacyFBSupport,
   enableDebugTracing,
   enableUseRefAccessWarning,
   enableLazyContextPropagation,
+  enableSyncDefaultUpdates,
   enableUnifiedSyncLane,
   enableTransitionTracing,
   enableCustomElementPropertySupport,
   enableDeferRootSchedulingToMicrotask,
+  diffInCommitPhase,
+  enableAsyncActions,
+  alwaysThrottleRetries,
 } = dynamicFeatureFlags;
 
 // On WWW, __EXPERIMENTAL__ is used for a new modern build.
@@ -70,6 +73,8 @@ export const enableCache = true;
 export const enableLegacyCache = true;
 export const enableCacheElement = true;
 export const enableFetchInstrumentation = false;
+
+export const enableFormActions = true;
 
 export const disableJavaScriptURLs = true;
 

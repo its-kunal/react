@@ -549,8 +549,32 @@ function serializeProviderReference(name: string): string {
   return '$P' + name;
 }
 
+function serializeNumber(number: number): string | number {
+  if (Number.isFinite(number)) {
+    if (number === 0 && 1 / number === -Infinity) {
+      return '$-0';
+    } else {
+      return number;
+    }
+  } else {
+    if (number === Infinity) {
+      return '$Infinity';
+    } else if (number === -Infinity) {
+      return '$-Infinity';
+    } else {
+      return '$NaN';
+    }
+  }
+}
+
 function serializeUndefined(): string {
   return '$undefined';
+}
+
+function serializeDateFromDateJSON(dateJSON: string): string {
+  // JSON.stringify automatically calls Date.prototype.toJSON which calls toISOString.
+  // We need only tack on a $D prefix.
+  return '$D' + dateJSON;
 }
 
 function serializeBigInt(n: bigint): string {
@@ -669,10 +693,15 @@ export function resolveModelToJSON(
   key: string,
   value: ReactClientValue,
 ): ReactJSONValue {
+  // Make sure that `parent[key]` wasn't JSONified before `value` was passed to us
   if (__DEV__) {
     // $FlowFixMe[incompatible-use]
     const originalValue = parent[key];
-    if (typeof originalValue === 'object' && originalValue !== value) {
+    if (
+      typeof originalValue === 'object' &&
+      originalValue !== value &&
+      !(originalValue instanceof Date)
+    ) {
       if (objectName(originalValue) !== 'Object') {
         const jsxParentType = jsxChildrenParents.get(parent);
         if (typeof jsxParentType === 'string') {
@@ -874,11 +903,26 @@ export function resolveModelToJSON(
   }
 
   if (typeof value === 'string') {
+    // TODO: Maybe too clever. If we support URL there's no similar trick.
+    if (value[value.length - 1] === 'Z') {
+      // Possibly a Date, whose toJSON automatically calls toISOString
+      // $FlowFixMe[incompatible-use]
+      const originalValue = parent[key];
+      // $FlowFixMe[method-unbinding]
+      if (originalValue instanceof Date) {
+        return serializeDateFromDateJSON(value);
+      }
+    }
+
     return escapeStringValue(value);
   }
 
-  if (typeof value === 'boolean' || typeof value === 'number') {
+  if (typeof value === 'boolean') {
     return value;
+  }
+
+  if (typeof value === 'number') {
+    return serializeNumber(value);
   }
 
   if (typeof value === 'undefined') {

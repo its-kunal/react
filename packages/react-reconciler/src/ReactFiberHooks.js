@@ -15,6 +15,7 @@ import type {
   StartTransitionOptions,
   Usable,
   Thenable,
+  RejectedThenable,
 } from 'shared/ReactTypes';
 import type {
   Fiber,
@@ -41,6 +42,7 @@ import {
   enableUseEffectEventHook,
   enableLegacyCache,
   debugRenderPhaseSideEffectsForStrictMode,
+  enableAsyncActions,
 } from 'shared/ReactFeatureFlags';
 import {
   REACT_CONTEXT_TYPE,
@@ -70,7 +72,6 @@ import {
   isTransitionLane,
   markRootEntangled,
   markRootMutableRead,
-  NoTimestamp,
 } from './ReactFiberLane';
 import {
   ContinuousEventPriority,
@@ -101,7 +102,6 @@ import {
   getWorkInProgressRootRenderLanes,
   scheduleUpdateOnFiber,
   requestUpdateLane,
-  requestEventTime,
   markSkippedUpdateLanes,
   isInvalidExecutionContextForEventFunction,
 } from './ReactFiberWorkLoop';
@@ -145,6 +145,7 @@ import {
 } from './ReactFiberThenable';
 import type {ThenableState} from './ReactFiberThenable';
 import type {BatchConfigTransition} from './ReactFiberTracingMarkerComponent';
+import {requestAsyncActionContext} from './ReactFiberAsyncAction';
 
 const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
 
@@ -180,11 +181,29 @@ export type Hook = {
   next: Hook | null,
 };
 
+// The effect "instance" is a shared object that remains the same for the entire
+// lifetime of an effect. In Rust terms, a RefCell. We use it to store the
+// "destroy" function that is returned from an effect, because that is stateful.
+// The field is `undefined` if the effect is unmounted, or if the effect ran
+// but is not stateful. We don't explicitly track whether the effect is mounted
+// or unmounted because that can be inferred by the hiddenness of the fiber in
+// the tree, i.e. whether there is a hidden Offscreen fiber above it.
+//
+// It's unfortunate that this is stored on a separate object, because it adds
+// more memory per effect instance, but it's conceptually sound. I think there's
+// likely a better data structure we could use for effects; perhaps just one
+// array of effect instances per fiber. But I think this is OK for now despite
+// the additional memory and we can follow up with performance
+// optimizations later.
+type EffectInstance = {
+  destroy: void | (() => void),
+};
+
 export type Effect = {
   tag: HookFlags,
   create: () => (() => void) | void,
-  destroy: (() => void) | void,
-  deps: Array<mixed> | void | null,
+  inst: EffectInstance,
+  deps: Array<mixed> | null,
   next: Effect,
 };
 
@@ -931,38 +950,40 @@ if (enableUseMemoCacheHook) {
   };
 }
 
+function useThenable<T>(thenable: Thenable<T>): T {
+  // Track the position of the thenable within this fiber.
+  const index = thenableIndexCounter;
+  thenableIndexCounter += 1;
+  if (thenableState === null) {
+    thenableState = createThenableState();
+  }
+  const result = trackUsedThenable(thenableState, thenable, index);
+  if (
+    currentlyRenderingFiber.alternate === null &&
+    (workInProgressHook === null
+      ? currentlyRenderingFiber.memoizedState === null
+      : workInProgressHook.next === null)
+  ) {
+    // Initial render, and either this is the first time the component is
+    // called, or there were no Hooks called after this use() the previous
+    // time (perhaps because it threw). Subsequent Hook calls should use the
+    // mount dispatcher.
+    if (__DEV__) {
+      ReactCurrentDispatcher.current = HooksDispatcherOnMountInDEV;
+    } else {
+      ReactCurrentDispatcher.current = HooksDispatcherOnMount;
+    }
+  }
+  return result;
+}
+
 function use<T>(usable: Usable<T>): T {
   if (usable !== null && typeof usable === 'object') {
     // $FlowFixMe[method-unbinding]
     if (typeof usable.then === 'function') {
       // This is a thenable.
       const thenable: Thenable<T> = (usable: any);
-
-      // Track the position of the thenable within this fiber.
-      const index = thenableIndexCounter;
-      thenableIndexCounter += 1;
-
-      if (thenableState === null) {
-        thenableState = createThenableState();
-      }
-      const result = trackUsedThenable(thenableState, thenable, index);
-      if (
-        currentlyRenderingFiber.alternate === null &&
-        (workInProgressHook === null
-          ? currentlyRenderingFiber.memoizedState === null
-          : workInProgressHook.next === null)
-      ) {
-        // Initial render, and either this is the first time the component is
-        // called, or there were no Hooks called after this use() the previous
-        // time (perhaps because it threw). Subsequent Hook calls should use the
-        // mount dispatcher.
-        if (__DEV__) {
-          ReactCurrentDispatcher.current = HooksDispatcherOnMountInDEV;
-        } else {
-          ReactCurrentDispatcher.current = HooksDispatcherOnMount;
-        }
-      }
-      return result;
+      return useThenable(thenable);
     } else if (
       usable.$$typeof === REACT_CONTEXT_TYPE ||
       usable.$$typeof === REACT_SERVER_CONTEXT_TYPE
@@ -1662,7 +1683,7 @@ function mountSyncExternalStore<T>(
   pushEffect(
     HookHasEffect | HookPassive,
     updateStoreInstance.bind(null, fiber, inst, nextSnapshot, getSnapshot),
-    undefined,
+    createEffectInstance(),
     null,
   );
 
@@ -1719,7 +1740,7 @@ function updateSyncExternalStore<T>(
     pushEffect(
       HookHasEffect | HookPassive,
       updateStoreInstance.bind(null, fiber, inst, nextSnapshot, getSnapshot),
-      undefined,
+      createEffectInstance(),
       null,
     );
 
@@ -1819,7 +1840,7 @@ function checkIfSnapshotChanged<T>(inst: StoreInstance<T>): boolean {
 function forceStoreRerender(fiber: Fiber) {
   const root = enqueueConcurrentRenderForLane(fiber, SyncLane);
   if (root !== null) {
-    scheduleUpdateOnFiber(root, fiber, SyncLane, NoTimestamp);
+    scheduleUpdateOnFiber(root, fiber, SyncLane);
   }
 }
 
@@ -1860,13 +1881,13 @@ function rerenderState<S>(
 function pushEffect(
   tag: HookFlags,
   create: () => (() => void) | void,
-  destroy: (() => void) | void,
-  deps: Array<mixed> | void | null,
+  inst: EffectInstance,
+  deps: Array<mixed> | null,
 ): Effect {
   const effect: Effect = {
     tag,
     create,
-    destroy,
+    inst,
     deps,
     // Circular
     next: (null: any),
@@ -1889,6 +1910,10 @@ function pushEffect(
     }
   }
   return effect;
+}
+
+function createEffectInstance(): EffectInstance {
+  return {destroy: undefined};
 }
 
 let stackContainsErrorMessage: boolean | null = null;
@@ -1994,7 +2019,7 @@ function mountEffectImpl(
   hook.memoizedState = pushEffect(
     HookHasEffect | hookFlags,
     create,
-    undefined,
+    createEffectInstance(),
     nextDeps,
   );
 }
@@ -2007,16 +2032,16 @@ function updateEffectImpl(
 ): void {
   const hook = updateWorkInProgressHook();
   const nextDeps = deps === undefined ? null : deps;
-  let destroy = undefined;
+  const effect: Effect = hook.memoizedState;
+  const inst = effect.inst;
 
   // currentHook is null when rerendering after a render phase state update.
   if (currentHook !== null) {
-    const prevEffect = currentHook.memoizedState;
-    destroy = prevEffect.destroy;
     if (nextDeps !== null) {
+      const prevEffect: Effect = currentHook.memoizedState;
       const prevDeps = prevEffect.deps;
       if (areHookInputsEqual(nextDeps, prevDeps)) {
-        hook.memoizedState = pushEffect(hookFlags, create, destroy, nextDeps);
+        hook.memoizedState = pushEffect(hookFlags, create, inst, nextDeps);
         return;
       }
     }
@@ -2027,7 +2052,7 @@ function updateEffectImpl(
   hook.memoizedState = pushEffect(
     HookHasEffect | hookFlags,
     create,
-    destroy,
+    inst,
     nextDeps,
   );
 }
@@ -2380,8 +2405,8 @@ function updateDeferredValueImpl<T>(hook: Hook, prevValue: T, value: T): T {
 }
 
 function startTransition(
-  setPending: boolean => void,
-  callback: () => void,
+  setPending: (Thenable<boolean> | boolean) => void,
+  callback: () => mixed,
   options?: StartTransitionOptions,
 ): void {
   const previousPriority = getCurrentUpdatePriority();
@@ -2407,8 +2432,36 @@ function startTransition(
   }
 
   try {
-    setPending(false);
-    callback();
+    if (enableAsyncActions) {
+      const returnValue = callback();
+
+      // `isPending` is either `false` or a thenable that resolves to `false`,
+      // depending on whether the action scope is an async function. In the
+      // async case, the resulting render will suspend until the async action
+      // scope has finished.
+      const isPending = requestAsyncActionContext(returnValue);
+      setPending(isPending);
+    } else {
+      // Async actions are not enabled.
+      setPending(false);
+      callback();
+    }
+  } catch (error) {
+    if (enableAsyncActions) {
+      // This is a trick to get the `useTransition` hook to rethrow the error.
+      // When it unwraps the thenable with the `use` algorithm, the error
+      // will be thrown.
+      const rejectedThenable: RejectedThenable<boolean> = {
+        then() {},
+        status: 'rejected',
+        reason: error,
+      };
+      setPending(rejectedThenable);
+    } else {
+      // The error rethrowing behavior is only enabled when the async actions
+      // feature is on, even for sync actions.
+      throw error;
+    }
   } finally {
     setCurrentUpdatePriority(previousPriority);
 
@@ -2434,21 +2487,26 @@ function mountTransition(): [
   boolean,
   (callback: () => void, options?: StartTransitionOptions) => void,
 ] {
-  const [isPending, setPending] = mountState(false);
+  const [, setPending] = mountState((false: Thenable<boolean> | boolean));
   // The `start` method never changes.
   const start = startTransition.bind(null, setPending);
   const hook = mountWorkInProgressHook();
   hook.memoizedState = start;
-  return [isPending, start];
+  return [false, start];
 }
 
 function updateTransition(): [
   boolean,
   (callback: () => void, options?: StartTransitionOptions) => void,
 ] {
-  const [isPending] = updateState(false);
+  const [booleanOrThenable] = updateState(false);
   const hook = updateWorkInProgressHook();
   const start = hook.memoizedState;
+  const isPending =
+    typeof booleanOrThenable === 'boolean'
+      ? booleanOrThenable
+      : // This will suspend until the async action scope has finished.
+        useThenable(booleanOrThenable);
   return [isPending, start];
 }
 
@@ -2456,9 +2514,14 @@ function rerenderTransition(): [
   boolean,
   (callback: () => void, options?: StartTransitionOptions) => void,
 ] {
-  const [isPending] = rerenderState(false);
+  const [booleanOrThenable] = rerenderState(false);
   const hook = updateWorkInProgressHook();
   const start = hook.memoizedState;
+  const isPending =
+    typeof booleanOrThenable === 'boolean'
+      ? booleanOrThenable
+      : // This will suspend until the async action scope has finished.
+        useThenable(booleanOrThenable);
   return [isPending, start];
 }
 
@@ -2536,8 +2599,7 @@ function refreshCache<T>(fiber: Fiber, seedKey: ?() => T, seedValue: T): void {
         const refreshUpdate = createLegacyQueueUpdate(lane);
         const root = enqueueLegacyQueueUpdate(provider, refreshUpdate, lane);
         if (root !== null) {
-          const eventTime = requestEventTime();
-          scheduleUpdateOnFiber(root, provider, lane, eventTime);
+          scheduleUpdateOnFiber(root, provider, lane);
           entangleLegacyQueueTransitions(root, provider, lane);
         }
 
@@ -2601,8 +2663,7 @@ function dispatchReducerAction<S, A>(
   } else {
     const root = enqueueConcurrentHookUpdate(fiber, queue, update, lane);
     if (root !== null) {
-      const eventTime = requestEventTime();
-      scheduleUpdateOnFiber(root, fiber, lane, eventTime);
+      scheduleUpdateOnFiber(root, fiber, lane);
       entangleTransitionUpdate(root, queue, lane);
     }
   }
@@ -2684,8 +2745,7 @@ function dispatchSetState<S, A>(
 
     const root = enqueueConcurrentHookUpdate(fiber, queue, update, lane);
     if (root !== null) {
-      const eventTime = requestEventTime();
-      scheduleUpdateOnFiber(root, fiber, lane, eventTime);
+      scheduleUpdateOnFiber(root, fiber, lane);
       entangleTransitionUpdate(root, queue, lane);
     }
   }

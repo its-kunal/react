@@ -17,8 +17,11 @@ import * as dynamicFlags from 'ReactNativeInternalFeatureFlags';
 
 // We destructure each value before re-exporting to avoid a dynamic look-up on
 // the exports object every time a flag is read.
-export const {enableUseRefAccessWarning, enableDeferRootSchedulingToMicrotask} =
-  dynamicFlags;
+export const {
+  enableUseRefAccessWarning,
+  enableDeferRootSchedulingToMicrotask,
+  alwaysThrottleRetries,
+} = dynamicFlags;
 
 // The rest of the flags are static for better dead code elimination.
 export const enableDebugTracing = false;
@@ -32,6 +35,7 @@ export const enableCache = false;
 export const enableLegacyCache = false;
 export const enableCacheElement = true;
 export const enableFetchInstrumentation = false;
+export const enableFormActions = true; // Doesn't affect Native
 export const enableSchedulerDebugging = false;
 export const debugRenderPhaseSideEffectsForStrictMode = true;
 export const disableJavaScriptURLs = false;
@@ -43,7 +47,6 @@ export const enableScopeAPI = false;
 export const enableCreateEventHandleAPI = false;
 export const enableSuspenseCallback = false;
 export const disableLegacyContext = false;
-export const revertRemovalOfSiblingPrerendering = false;
 export const enableTrustedTypesIntegration = false;
 export const disableTextareaChildren = false;
 export const disableModulePatternComponents = false;
@@ -64,6 +67,7 @@ export const createRootStrictEffectsByDefault = false;
 export const disableSchedulerTimeoutInWorkLoop = false;
 export const enableLazyContextPropagation = false;
 export const enableLegacyHidden = true;
+export const enableSyncDefaultUpdates = true;
 export const enableUnifiedSyncLane = false;
 export const allowConcurrentByDefault = true;
 export const enableCustomElementPropertySupport = false;
@@ -80,6 +84,9 @@ export const enableHostSingletons = true;
 
 export const useModernStrictMode = false;
 export const enableFizzExternalRuntime = false;
+
+export const diffInCommitPhase = true;
+export const enableAsyncActions = false;
 
 // Flow magic to verify the exports of this file match the original version.
 ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
